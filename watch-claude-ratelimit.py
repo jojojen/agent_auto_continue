@@ -67,12 +67,27 @@ DEBOUNCE_SECS = int(os.environ.get("CLAUDE_WATCH_DEBOUNCE", "90"))
 # the debounce has expired, so without this cooldown the stale re-read parses
 # its just-passed reset as TOMORROW and locks the watcher asleep ~24h.
 POST_SEND_COOLDOWN_SECS = int(os.environ.get("CLAUDE_WATCH_POST_SEND_COOLDOWN", "300"))
-# Defense-in-depth clamp: a usage-limit reset is never more than a few hours out,
-# so any computed wait beyond this is almost certainly a mis-parse (e.g. a just-
-# passed time read as TOMORROW => ~24h). Clamp to a short re-check instead of ever
-# sleeping the watcher into a multi-hour/day lockup. Catches ALL parse failures,
-# independent of the post-send cooldown / debounce.
-MAX_WAIT_SECS = int(os.environ.get("CLAUDE_WATCH_MAX_WAIT", str(6 * 3600)))
+# Sanity cap on a single wait. This must be ABOVE the longest legitimate reset:
+# Claude has a weekly usage limit whose reset can be several DAYS out, and the
+# absolute-date parser ("resets Jun 6 at 7am") exists precisely to handle that.
+# An earlier 6h cap here was a bug: it assumed "a reset is never more than a few
+# hours out" and so clamped every genuine multi-day/weekly reset down to a 300s
+# re-check, making the watcher fire `continue` while still rate-limited, in a loop
+# — i.e. unusable for multi-day limits. The 24h re-read lockout is NOT handled by
+# this cap; it is handled precisely by POST_SEND_COOLDOWN_SECS above (which
+# suppresses the just-fired banner). This cap only catches a truly absurd
+# mis-parse (e.g. a cross-year rollover ~365d out). 8 days = weekly limit + margin.
+MAX_WAIT_SECS = int(os.environ.get("CLAUDE_WATCH_MAX_WAIT", str(8 * 86400)))
+# Never block on a single opaque time.sleep(): a mis-parsed far-future reset must
+# not be able to put the watcher to sleep for hours/a day (the "weird sleep"
+# failure that recurred). Every wait is split into <= WAIT_CHUNK_SECS naps and
+# hard-capped by MAX_WAIT_SECS, so the process stays observable, interruptible,
+# and can never sleep past the cap regardless of any parse bug.
+WAIT_CHUNK_SECS = int(os.environ.get("CLAUDE_WATCH_WAIT_CHUNK", "60"))
+FALLBACK_SLEEP_SECS = 300
+# How often to log "still waiting" progress during a long (multi-day) wait so the
+# watcher is visibly alive rather than an opaque blackout.
+PROGRESS_LOG_SECS = int(os.environ.get("CLAUDE_WATCH_PROGRESS_LOG", "1800"))
 DEFAULT_LOG_PATH = Path.home() / ".cache" / "agent-auto-continue" / "watch.log"
 LOG_PATH = Path(os.environ.get("CLAUDE_WATCH_LOG", str(DEFAULT_LOG_PATH)))
 SESSION_POLL_SECS = 60
@@ -228,34 +243,72 @@ def extract_rate_limit_text(line: str) -> str | None:
     return text or "(rate_limit event without text body)"
 
 
-def resolve_pane() -> str:
-    """Find the tmux pane currently running the ``claude`` TUI.
-
-    Hardcoding ``claude:0.0`` is fragile: window/pane indices shift when the
-    user opens other windows. We honor CLAUDE_WATCH_PANE if set, else query
-    tmux for the pane whose current command is ``claude`` and target it by its
-    stable pane id (``%N``). Falls back to ``claude:0.0`` if detection fails."""
-    if PANE:
-        return PANE
+def _claude_panes_by_activity() -> list[tuple[str, int]]:
+    """[(pane_id, window_activity_epoch), ...] for panes running ``claude``,
+    most-recently-active first. ``window_activity`` is a tmux epoch that bumps
+    whenever the pane prints output (incl. the rate-limit banner), so it ranks
+    the actively-driven session above long-idle ones — and claude never holds its
+    jsonl open, so this activity proxy is the only reliable pane↔session link."""
     try:
         out = subprocess.run(
             ["tmux", "list-panes", "-a", "-F",
-             "#{pane_current_command}\t#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}"],
+             "#{pane_id}\t#{window_activity}\t#{pane_current_command}"],
             check=False, timeout=10, capture_output=True, text=True,
         ).stdout
     except Exception as exc:
-        log(f"resolve_pane: tmux list-panes failed ({exc}); using {PANE_FALLBACK}")
-        return PANE_FALLBACK
+        log(f"resolve_pane: tmux list-panes failed ({exc})")
+        return []
+    rows: list[tuple[str, int]] = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) >= 2 and parts[0].strip() == "claude":
-            return parts[1].strip()  # stable %N pane id
+        if len(parts) >= 3 and parts[2].strip() == "claude":
+            act = int(parts[1]) if parts[1].strip().isdigit() else 0
+            rows.append((parts[0].strip(), act))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return rows
+
+
+def resolve_pane(current=None) -> str:
+    """Pick the tmux pane to send ``continue`` to. With several ``claude`` panes
+    open, the old "first claude pane" heuristic silently hit the wrong one (an idle
+    ``%0`` while the working session ran in ``%7``). Instead choose the MOST-
+    RECENTLY-ACTIVE claude pane: that is the session being actively driven — the
+    same one whose newest-mtime jsonl we tail and which therefore hits the limit.
+    A working-then-idle pane still outranks a long-idle one, so this holds through
+    the rate-limit cooldown until send time.
+
+    Order: (1) CLAUDE_WATCH_PANE if set; (2) most-recently-active claude pane;
+    (3) ``claude:0.0`` fallback. (``current`` is accepted for interface symmetry
+    with the tailed session but the activity ranking already encodes it.)"""
+    if PANE:
+        return PANE
+    panes = _claude_panes_by_activity()
+    if panes:
+        return panes[0][0]
     log(f"resolve_pane: no pane running 'claude'; using {PANE_FALLBACK}")
     return PANE_FALLBACK
 
 
-def send_continue() -> None:
-    target = resolve_pane()
+def sleep_in_chunks(total_secs: int) -> None:
+    """Wait total_secs, but in <= WAIT_CHUNK_SECS naps and hard-capped by
+    MAX_WAIT_SECS. Long (multi-day/weekly) waits are fine and supported; chunking
+    just keeps the wait interruptible and logs progress so it's never an opaque
+    blackout. The cap only ever trims a truly absurd mis-parse."""
+    capped = max(0, min(int(total_secs), MAX_WAIT_SECS))
+    deadline = time.monotonic() + capped
+    next_progress = time.monotonic() + PROGRESS_LOG_SECS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if time.monotonic() >= next_progress and remaining > PROGRESS_LOG_SECS:
+            log(f"...still waiting, ~{int(remaining)}s ({remaining/3600:.1f}h) left")
+            next_progress = time.monotonic() + PROGRESS_LOG_SECS
+        time.sleep(min(remaining, WAIT_CHUNK_SECS))
+
+
+def send_continue(current=None) -> None:
+    target = resolve_pane(current)
     log(f"Sending 'continue' to tmux pane {target}")
     try:
         # Send text and Enter as SEPARATE events with a pause between. Claude
@@ -323,7 +376,7 @@ def watch_loop() -> int:
         log(f"No .jsonl under {project_dir}; aborting.")
         return 1
     log(f"Workspace: {project_dir}")
-    log(f"Watching {current} (tmux pane: {PANE or 'auto:'+resolve_pane()}, "
+    log(f"Watching {current} (tmux pane: {PANE or 'auto:'+resolve_pane(current)}, "
         f"tz fallback: {_DEFAULT_TZ_NAME})")
     follower = TailFollower(current)
     follower.start()
@@ -372,19 +425,21 @@ def watch_loop() -> int:
                 now_utc = _dt.datetime.now(tz=_dt.timezone.utc)
                 reset_utc = parse_reset_at(text, now_utc)
                 if reset_utc is None:
-                    log("Could not parse reset time; fallback sleep 300s")
-                    wait_secs = 300
+                    log(f"Could not parse reset time; fallback wait {FALLBACK_SLEEP_SECS}s")
+                    wait_secs = FALLBACK_SLEEP_SECS
                 else:
-                    wait_secs = max(0, int((reset_utc - now_utc).total_seconds())) + BUFFER_SECS
-                    if wait_secs > MAX_WAIT_SECS:
-                        log(f"Computed wait {wait_secs}s exceeds max {MAX_WAIT_SECS}s "
-                            f"(likely mis-parse of {text!r}); clamping to 300s re-check")
-                        wait_secs = 300
+                    raw_wait = max(0, int((reset_utc - now_utc).total_seconds())) + BUFFER_SECS
+                    if raw_wait > MAX_WAIT_SECS:
+                        log(f"Computed wait {raw_wait}s exceeds sanity cap {MAX_WAIT_SECS}s "
+                            f"(~{MAX_WAIT_SECS/86400:.0f}d) — absurd, likely a mis-parse of "
+                            f"{text!r}; re-checking in {FALLBACK_SLEEP_SECS}s instead")
+                        wait_secs = FALLBACK_SLEEP_SECS
                     else:
-                        log(f"Reset at {reset_utc.isoformat()}; sleeping {wait_secs}s")
-                if wait_secs > 0:
-                    time.sleep(wait_secs)
-                send_continue()
+                        log(f"Reset at {reset_utc.isoformat()}; waiting {raw_wait}s "
+                            f"(~{raw_wait/3600:.1f}h, in <= {WAIT_CHUNK_SECS}s chunks)")
+                        wait_secs = raw_wait
+                sleep_in_chunks(wait_secs)
+                send_continue(current)
                 last_send_mono = time.monotonic()
         except Exception as exc:
             log(f"Tail iterator failed ({exc}); restarting tail in 5s")
