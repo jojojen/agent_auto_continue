@@ -67,6 +67,12 @@ DEBOUNCE_SECS = int(os.environ.get("CLAUDE_WATCH_DEBOUNCE", "90"))
 # the debounce has expired, so without this cooldown the stale re-read parses
 # its just-passed reset as TOMORROW and locks the watcher asleep ~24h.
 POST_SEND_COOLDOWN_SECS = int(os.environ.get("CLAUDE_WATCH_POST_SEND_COOLDOWN", "300"))
+# Defense-in-depth clamp: a usage-limit reset is never more than a few hours out,
+# so any computed wait beyond this is almost certainly a mis-parse (e.g. a just-
+# passed time read as TOMORROW => ~24h). Clamp to a short re-check instead of ever
+# sleeping the watcher into a multi-hour/day lockup. Catches ALL parse failures,
+# independent of the post-send cooldown / debounce.
+MAX_WAIT_SECS = int(os.environ.get("CLAUDE_WATCH_MAX_WAIT", str(6 * 3600)))
 DEFAULT_LOG_PATH = Path.home() / ".cache" / "agent-auto-continue" / "watch.log"
 LOG_PATH = Path(os.environ.get("CLAUDE_WATCH_LOG", str(DEFAULT_LOG_PATH)))
 SESSION_POLL_SECS = 60
@@ -370,7 +376,12 @@ def watch_loop() -> int:
                     wait_secs = 300
                 else:
                     wait_secs = max(0, int((reset_utc - now_utc).total_seconds())) + BUFFER_SECS
-                    log(f"Reset at {reset_utc.isoformat()}; sleeping {wait_secs}s")
+                    if wait_secs > MAX_WAIT_SECS:
+                        log(f"Computed wait {wait_secs}s exceeds max {MAX_WAIT_SECS}s "
+                            f"(likely mis-parse of {text!r}); clamping to 300s re-check")
+                        wait_secs = 300
+                    else:
+                        log(f"Reset at {reset_utc.isoformat()}; sleeping {wait_secs}s")
                 if wait_secs > 0:
                     time.sleep(wait_secs)
                 send_continue()
