@@ -49,12 +49,24 @@ except ImportError:  # pragma: no cover
     from pytz import timezone as ZoneInfo  # type: ignore[assignment]
 
 
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
 _DEFAULT_TZ_NAME = os.environ.get("CLAUDE_WATCH_DEFAULT_TZ", "Asia/Tokyo")
 DEFAULT_TZ = ZoneInfo(_DEFAULT_TZ_NAME)
-PANE = os.environ.get("CLAUDE_WATCH_PANE", "claude:0.0")
+PANE_FALLBACK = "claude:0.0"
+PANE = os.environ.get("CLAUDE_WATCH_PANE", "")  # empty => auto-detect at send time
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 BUFFER_SECS = int(os.environ.get("CLAUDE_WATCH_BUFFER", "10"))
 DEBOUNCE_SECS = int(os.environ.get("CLAUDE_WATCH_DEBOUNCE", "90"))
+# After sending 'continue', ignore further rate-limit hits for this long. The
+# debounce above is keyed to DETECTION time, but a trigger sleeps for hours
+# before sending; by the time the just-fired banner is re-read a second later,
+# the debounce has expired, so without this cooldown the stale re-read parses
+# its just-passed reset as TOMORROW and locks the watcher asleep ~24h.
+POST_SEND_COOLDOWN_SECS = int(os.environ.get("CLAUDE_WATCH_POST_SEND_COOLDOWN", "300"))
 DEFAULT_LOG_PATH = Path.home() / ".cache" / "agent-auto-continue" / "watch.log"
 LOG_PATH = Path(os.environ.get("CLAUDE_WATCH_LOG", str(DEFAULT_LOG_PATH)))
 SESSION_POLL_SECS = 60
@@ -115,6 +127,35 @@ def parse_reset_at(text: str, now_utc: _dt.datetime) -> _dt.datetime | None:
         tz = DEFAULT_TZ
     now_local = now_utc.astimezone(tz)
     lowered = text.lower()
+
+    # "resets May 31 at 7am" / "resets on Jun 3 at 7:30 am" / "resets Dec 1 at 14:30"
+    # (absolute date — the reset may be several days out, so we parse month+day,
+    # not just the time-of-day. This is the format the live TUI actually emits.)
+    m = re.search(
+        r"resets?\s+(?:on\s+)?([a-z]{3,9})\.?\s+(\d{1,2})\s+at\s+"
+        r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?",
+        lowered,
+    )
+    if m and m.group(1)[:3] in _MONTHS:
+        mon = _MONTHS[m.group(1)[:3]]
+        day = int(m.group(2))
+        h = int(m.group(3))
+        mi = int(m.group(4)) if m.group(4) else 0
+        ap = m.group(5)
+        if ap == "pm" and h != 12:
+            h += 12
+        elif ap == "am" and h == 12:
+            h = 0
+        try:
+            target = now_local.replace(
+                month=mon, day=day, hour=h, minute=mi, second=0, microsecond=0
+            )
+            # Cross-year: a month/day already behind us means next year.
+            if target < now_local - _dt.timedelta(days=1):
+                target = target.replace(year=target.year + 1)
+            return target.astimezone(_dt.timezone.utc)
+        except ValueError:
+            pass
 
     # "resets in 2h" / "resets in 90m"
     m = re.search(r"resets?\s+in\s+(\d+)\s*([hm])", lowered)
@@ -181,13 +222,47 @@ def extract_rate_limit_text(line: str) -> str | None:
     return text or "(rate_limit event without text body)"
 
 
-def send_continue() -> None:
-    log(f"Sending 'continue' to tmux pane {PANE}")
+def resolve_pane() -> str:
+    """Find the tmux pane currently running the ``claude`` TUI.
+
+    Hardcoding ``claude:0.0`` is fragile: window/pane indices shift when the
+    user opens other windows. We honor CLAUDE_WATCH_PANE if set, else query
+    tmux for the pane whose current command is ``claude`` and target it by its
+    stable pane id (``%N``). Falls back to ``claude:0.0`` if detection fails."""
+    if PANE:
+        return PANE
     try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_current_command}\t#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}"],
+            check=False, timeout=10, capture_output=True, text=True,
+        ).stdout
+    except Exception as exc:
+        log(f"resolve_pane: tmux list-panes failed ({exc}); using {PANE_FALLBACK}")
+        return PANE_FALLBACK
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0].strip() == "claude":
+            return parts[1].strip()  # stable %N pane id
+    log(f"resolve_pane: no pane running 'claude'; using {PANE_FALLBACK}")
+    return PANE_FALLBACK
+
+
+def send_continue() -> None:
+    target = resolve_pane()
+    log(f"Sending 'continue' to tmux pane {target}")
+    try:
+        # Send text and Enter as SEPARATE events with a pause between. Claude
+        # Code's Ink TUI debounces input; a combined "continue" + "Enter" often
+        # lands the Enter before the text registers, leaving it unsubmitted.
         subprocess.run(
-            ["tmux", "send-keys", "-t", PANE, "continue", "Enter"],
-            check=False,
-            timeout=10,
+            ["tmux", "send-keys", "-t", target, "-l", "continue"],
+            check=False, timeout=10,
+        )
+        time.sleep(0.8)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", target, "Enter"],
+            check=False, timeout=10,
         )
     except Exception as exc:
         log(f"tmux send-keys failed: {exc}")
@@ -242,7 +317,8 @@ def watch_loop() -> int:
         log(f"No .jsonl under {project_dir}; aborting.")
         return 1
     log(f"Workspace: {project_dir}")
-    log(f"Watching {current} (tmux pane: {PANE}, tz fallback: {_DEFAULT_TZ_NAME})")
+    log(f"Watching {current} (tmux pane: {PANE or 'auto:'+resolve_pane()}, "
+        f"tz fallback: {_DEFAULT_TZ_NAME})")
     follower = TailFollower(current)
     follower.start()
 
@@ -268,6 +344,7 @@ def watch_loop() -> int:
     poller.start()
 
     last_triggered = 0.0
+    last_send_mono = -float("inf")
     while True:
         try:
             for raw in follower.lines():
@@ -276,6 +353,10 @@ def watch_loop() -> int:
                     continue
 
                 now_mono = time.monotonic()
+                if now_mono - last_send_mono < POST_SEND_COOLDOWN_SECS:
+                    log(f"Suppressed (post-send cooldown "
+                        f"{int(now_mono - last_send_mono)}s): {text!r}")
+                    continue
                 if now_mono - last_triggered < DEBOUNCE_SECS:
                     log(f"Suppressed (debounce): {text!r}")
                     continue
@@ -293,6 +374,7 @@ def watch_loop() -> int:
                 if wait_secs > 0:
                     time.sleep(wait_secs)
                 send_continue()
+                last_send_mono = time.monotonic()
         except Exception as exc:
             log(f"Tail iterator failed ({exc}); restarting tail in 5s")
             try:
