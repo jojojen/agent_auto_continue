@@ -91,6 +91,23 @@ PROGRESS_LOG_SECS = int(os.environ.get("CLAUDE_WATCH_PROGRESS_LOG", "1800"))
 DEFAULT_LOG_PATH = Path.home() / ".cache" / "agent-auto-continue" / "watch.log"
 LOG_PATH = Path(os.environ.get("CLAUDE_WATCH_LOG", str(DEFAULT_LOG_PATH)))
 SESSION_POLL_SECS = 60
+PANE_CAPTURE_LINES = 120
+RATE_LIMIT_PANE_MARKERS = (
+    "you've hit your session limit",
+    "you've hit your weekly limit",
+    "you've hit your limit",
+    "usage limit",
+    "/upgrade to increase your usage limit",
+)
+EMPTY_SESSION_MARKERS = (
+    "there's nothing in progress to continue",
+    "there's no prior context to continue",
+    "there's still no task in progress to continue",
+    "i don't have anything to continue",
+    "nothing to continue here",
+    "conversation was just cleared",
+    "what would you like to work on?",
+)
 
 
 def log(msg: str) -> None:
@@ -136,7 +153,12 @@ def latest_session_log(project_dir: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def parse_reset_at(text: str, now_utc: _dt.datetime) -> _dt.datetime | None:
+def parse_reset_at(
+    text: str,
+    now_utc: _dt.datetime,
+    *,
+    roll_forward_time_only: bool = True,
+) -> _dt.datetime | None:
     """Return absolute reset time as a UTC-aware datetime, or None on failure."""
     tz_match = re.search(r"\(([A-Za-z]+/[A-Za-z_]+)\)", text)
     if tz_match:
@@ -189,7 +211,7 @@ def parse_reset_at(text: str, now_utc: _dt.datetime) -> _dt.datetime | None:
     if m:
         h, mi = int(m.group(1)), int(m.group(2))
         target = now_local.replace(hour=h, minute=mi, second=0, microsecond=0)
-        if target <= now_local:
+        if roll_forward_time_only and target <= now_local:
             target += _dt.timedelta(days=1)
         return target.astimezone(_dt.timezone.utc)
 
@@ -204,7 +226,7 @@ def parse_reset_at(text: str, now_utc: _dt.datetime) -> _dt.datetime | None:
         elif ap == "am" and h == 12:
             h = 0
         target = now_local.replace(hour=h, minute=mi, second=0, microsecond=0)
-        if target <= now_local:
+        if roll_forward_time_only and target <= now_local:
             target += _dt.timedelta(days=1)
         return target.astimezone(_dt.timezone.utc)
 
@@ -213,7 +235,7 @@ def parse_reset_at(text: str, now_utc: _dt.datetime) -> _dt.datetime | None:
     if m:
         h, mi = int(m.group(1)), int(m.group(2))
         target = now_local.replace(hour=h, minute=mi, second=0, microsecond=0)
-        if target <= now_local:
+        if roll_forward_time_only and target <= now_local:
             target += _dt.timedelta(days=1)
         return target.astimezone(_dt.timezone.utc)
 
@@ -268,6 +290,119 @@ def _claude_panes_by_activity() -> list[tuple[str, int]]:
     return rows
 
 
+def _pane_runs_claude(pane_id: str) -> bool:
+    if not pane_id:
+        return False
+    try:
+        out = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_current_command}"],
+            check=False,
+            timeout=10,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception as exc:
+        log(f"resolve_pane: could not inspect {pane_id} ({exc})")
+        return False
+    return out == "claude"
+
+
+def _capture_pane_tail(pane_id: str, *, lines: int = PANE_CAPTURE_LINES) -> str:
+    try:
+        return subprocess.run(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", f"-{lines}"],
+            check=False,
+            timeout=10,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except Exception as exc:
+        log(f"resolve_pane: could not capture {pane_id} ({exc})")
+        return ""
+
+
+def _pane_text_has_any(pane_text: str, markers: tuple[str, ...]) -> bool:
+    lowered = pane_text.lower()
+    return any(marker in lowered for marker in markers)
+
+
+def _extract_visible_rate_limit_banner(pane_text: str) -> str | None:
+    for line in reversed(pane_text.splitlines()):
+        stripped = line.strip()
+        if (
+            stripped
+            and _pane_text_has_any(stripped, RATE_LIMIT_PANE_MARKERS)
+            and "reset" in stripped.lower()
+        ):
+            return stripped
+    return None
+
+
+def _select_best_claude_pane() -> tuple[str | None, str]:
+    panes = _claude_panes_by_activity()
+    if not panes:
+        return None, "no-claude-panes"
+
+    pane_tails = {
+        pane_id: _capture_pane_tail(pane_id)
+        for pane_id, _activity in panes
+    }
+
+    rate_limited = [
+        (pane_id, activity)
+        for pane_id, activity in panes
+        if _pane_text_has_any(pane_tails.get(pane_id, ""), RATE_LIMIT_PANE_MARKERS)
+    ]
+    if rate_limited:
+        return rate_limited[0][0], "rate-limit-banner-visible"
+
+    non_empty = [
+        (pane_id, activity)
+        for pane_id, activity in panes
+        if not _pane_text_has_any(pane_tails.get(pane_id, ""), EMPTY_SESSION_MARKERS)
+    ]
+    if non_empty:
+        return non_empty[0][0], "most-active-non-empty-pane"
+
+    return panes[0][0], "fallback-most-active-pane"
+
+
+def recover_visible_rate_limit_state() -> bool:
+    pane_id, reason = _select_best_claude_pane()
+    if not pane_id or reason != "rate-limit-banner-visible":
+        return False
+    pane_text = _capture_pane_tail(pane_id)
+    banner = _extract_visible_rate_limit_banner(pane_text)
+    if not banner:
+        return False
+
+    now_utc = _dt.datetime.now(tz=_dt.timezone.utc)
+    reset_utc = parse_reset_at(
+        banner,
+        now_utc,
+        roll_forward_time_only=False,
+    )
+    if reset_utc is None:
+        log(f"recover_visible_rate_limit_state: could not parse banner {banner!r}")
+        return False
+
+    raw_wait = max(0, int((reset_utc - now_utc).total_seconds())) + BUFFER_SECS
+    if raw_wait > MAX_WAIT_SECS:
+        log(
+            f"recover_visible_rate_limit_state: computed wait {raw_wait}s exceeds "
+            f"sanity cap {MAX_WAIT_SECS}s for banner {banner!r}; skipping recovery"
+        )
+        return False
+
+    log(
+        f"recover_visible_rate_limit_state: recovered {pane_id} from visible banner "
+        f"{banner!r}; waiting {raw_wait}s before continue"
+    )
+    sleep_in_chunks(raw_wait)
+    send_continue()
+    return True
+
+
 def resolve_pane(current=None) -> str:
     """Pick the tmux pane to send ``continue`` to. With several ``claude`` panes
     open, the old "first claude pane" heuristic silently hit the wrong one (an idle
@@ -277,14 +412,16 @@ def resolve_pane(current=None) -> str:
     A working-then-idle pane still outranks a long-idle one, so this holds through
     the rate-limit cooldown until send time.
 
-    Order: (1) CLAUDE_WATCH_PANE if set; (2) most-recently-active claude pane;
-    (3) ``claude:0.0`` fallback. (``current`` is accepted for interface symmetry
-    with the tailed session but the activity ranking already encodes it.)"""
+    Order: (1) CLAUDE_WATCH_PANE if set; (2) among live Claude panes, prefer one
+    whose visible content still shows a rate-limit banner; (3) otherwise the most-
+    recently-active Claude pane that is NOT an empty "nothing to continue" session;
+    (4) fallback to the most-recently-active Claude pane; (5) ``claude:0.0``."""
     if PANE:
         return PANE
-    panes = _claude_panes_by_activity()
-    if panes:
-        return panes[0][0]
+    pane_id, reason = _select_best_claude_pane()
+    if pane_id:
+        log(f"resolve_pane: selected {pane_id} ({reason})")
+        return pane_id
     log(f"resolve_pane: no pane running 'claude'; using {PANE_FALLBACK}")
     return PANE_FALLBACK
 
@@ -376,8 +513,10 @@ def watch_loop() -> int:
         log(f"No .jsonl under {project_dir}; aborting.")
         return 1
     log(f"Workspace: {project_dir}")
-    log(f"Watching {current} (tmux pane: {PANE or 'auto:'+resolve_pane(current)}, "
-        f"tz fallback: {_DEFAULT_TZ_NAME})")
+    log(
+        f"Watching {current} (tmux pane: {PANE or 'auto:'+resolve_pane(current)}, "
+        f"tz fallback: {_DEFAULT_TZ_NAME})"
+    )
     follower = TailFollower(current)
     follower.start()
 
@@ -404,6 +543,8 @@ def watch_loop() -> int:
 
     last_triggered = 0.0
     last_send_mono = -float("inf")
+    if recover_visible_rate_limit_state():
+        last_send_mono = time.monotonic()
     while True:
         try:
             for raw in follower.lines():

@@ -27,7 +27,10 @@ This watcher:
    pulled from a trailing `(Region/City)` tag; falls back to `Asia/Tokyo`
    (override with `CLAUDE_WATCH_DEFAULT_TZ`).
 3. **Sleeps** until the reset moment + a 10-second buffer.
-4. **Types `continue` and Enter** into your tmux pane via `tmux send-keys`.
+4. **Types `continue` and Enter** into the correct Claude tmux pane via `tmux send-keys`.
+5. **Recovers on restart**: if the watcher restarts while a rate-limit banner is
+   still visible in a Claude pane, it reconstructs the wait from that banner and
+   sends the missed `continue` instead of waiting for a brand-new JSONL event.
 
 Detection ↔ injection are decoupled: detection works without tmux (just log
 tailing), but injection currently relies on tmux because Claude Code's TUI
@@ -40,8 +43,7 @@ keystroke API.
 - Python ≥ 3.9 (stdlib only; uses `zoneinfo`, `urllib`, `subprocess`)
 - `tmux` ≥ 3.0
 - Claude Code (you're already using it)
-- You run Claude Code **inside a tmux pane** (default target `claude:0.0` —
-  override via `CLAUDE_WATCH_PANE`)
+- You run Claude Code **inside tmux**
 
 ## Quick start (Claude can do this for you)
 
@@ -67,7 +69,7 @@ keystroke API.
 4. Start Claude Code in your tmux pane as usual.
 
 The watcher logs every event it sees to `~/.cache/agent-auto-continue/watch.log`,
-so you can audit exactly what it detected and when it fired.
+so you can audit exactly what it detected, which pane it picked, and when it fired.
 
 ## How Claude should set this up for you
 
@@ -86,7 +88,7 @@ All knobs are environment variables. Set them before launching the watcher.
 
 | env var | default | what it controls |
 |---------|---------|------------------|
-| `CLAUDE_WATCH_PANE` | `claude:0.0` | tmux target for `send-keys` |
+| `CLAUDE_WATCH_PANE` | *auto-select* | optional hard override for the tmux target; when unset, the watcher inspects live Claude panes and picks the best match |
 | `CLAUDE_WATCH_PROJECT_DIR` | *auto-detected* | path to `~/.claude/projects/<workspace>` for THIS session — when unset, the workspace whose `.jsonl` files were touched most recently is used |
 | `CLAUDE_WATCH_BUFFER` | `10` | seconds added after the parsed reset moment before sending `continue` |
 | `CLAUDE_WATCH_DEBOUNCE` | `90` | suppress duplicate triggers within N seconds (Claude Code sometimes logs the rate-limit twice) |
@@ -107,7 +109,8 @@ You should see startup lines like:
 ```
 [2026-05-26T01:23:45] agent_auto_continue watcher starting
 [2026-05-26T01:23:45] Workspace: /Users/you/.claude/projects/-Users-you-my-project
-[2026-05-26T01:23:45] Watching /Users/you/.claude/projects/-Users-you-my-project/<session>.jsonl (tmux pane: claude:0.0, tz fallback: Asia/Tokyo)
+[2026-05-26T01:23:45] resolve_pane: selected %7 (rate-limit-banner-visible)
+[2026-05-26T01:23:45] Watching /Users/you/.claude/projects/-Users-you-my-project/<session>.jsonl (tmux pane: auto:%7, tz fallback: Asia/Tokyo)
 ```
 
 The next time you hit a rate limit, the log will show:
@@ -115,8 +118,20 @@ The next time you hit a rate limit, the log will show:
 ```
 […] Rate-limit detected: "You've hit your limit · resets 1am (America/Los_Angeles)"
 […] Reset at 2026-05-26T08:00:00+00:00; sleeping 73215s
-[…] Sending 'continue' to tmux pane claude:0.0
+[…] resolve_pane: selected %7 (rate-limit-banner-visible)
+[…] Sending 'continue' to tmux pane %7
 ```
+
+Pane selection is no longer "first pane wins". When `CLAUDE_WATCH_PANE` is unset,
+the watcher prefers:
+
+1. a Claude pane whose visible content still shows a rate-limit banner
+2. otherwise the most recently active Claude pane that is not an empty
+   "nothing to continue" session
+3. otherwise the most recently active Claude pane
+
+That avoids the common failure mode where one Claude pane is empty after `/clear`
+while another pane is the one actually waiting on quota reset.
 
 ## Stopping the watcher
 
@@ -156,9 +171,11 @@ reset time arrive as structured fields rather than English prose.
   yourself (e.g. by upgrading your plan), the watcher will still send
   `continue` later. Restart Claude Code at any time — the worst case is a
   stray `continue` command that does nothing.
-- **One workspace at a time**: the watcher tails the most-recent JSONL log.
-  If you run multiple Claude Code workspaces simultaneously, run multiple
-  watchers, each with its own `CLAUDE_WATCH_PROJECT_DIR` + `CLAUDE_WATCH_PANE`.
+- **One workspace log at a time**: the watcher tails the most-recent JSONL log
+  inside one Claude workspace directory. If you run multiple Claude Code
+  workspaces simultaneously, run multiple watchers, each with its own
+  `CLAUDE_WATCH_PROJECT_DIR`. Within one workspace, it can still choose among
+  multiple live Claude tmux panes heuristically.
 
 ## License
 

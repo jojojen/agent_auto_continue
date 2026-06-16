@@ -36,19 +36,18 @@ command -v tmux
 
 If `python3 < 3.9`, the `zoneinfo` import fails — recommend an upgrade.
 
-## Step 2 — Confirm the user's tmux pane name
+## Step 2 — Inspect the user's tmux panes
 
-The watcher needs to know **which tmux pane runs Claude Code**. Default is
-`claude:0.0`. Ask the user (or peek):
+The watcher injects through tmux, so confirm Claude is actually running there:
 
 ```bash
 tmux list-panes -a 2>&1 | head -20
 ```
 
-If the user has a pane targeting Claude Code (anything where they typed
-`claude` to start the CLI), note its name. If their setup matches the
-default `claude:0.0`, skip configuration. Otherwise have them set
-`CLAUDE_WATCH_PANE` before launching.
+Note any panes where `claude` is the current command. The watcher can now
+auto-select among multiple live Claude panes, so you usually do **not** need
+to set `CLAUDE_WATCH_PANE`. Only set it when the user explicitly wants a hard
+pin to one pane.
 
 ## Step 3 — Make scripts executable + run installer
 
@@ -64,13 +63,13 @@ annoying to undo, so it's explicit.
 
 ## Step 4 — Launch the watcher
 
-If the user's tmux pane is the default `claude:0.0`:
+Default launch (recommended; lets the watcher auto-select the best Claude pane):
 
 ```bash
 nohup ./watch-claude-ratelimit.sh </dev/null >/tmp/agent-auto-continue.stdout 2>&1 &
 ```
 
-If a different pane (e.g. `mywork:1.0`):
+Only hard-pin a pane when the user asks for it (e.g. `mywork:1.0`):
 
 ```bash
 CLAUDE_WATCH_PANE=mywork:1.0 nohup ./watch-claude-ratelimit.sh \
@@ -94,11 +93,18 @@ The log should show:
 ```
 […] agent_auto_continue watcher starting
 […] Workspace: /Users/<user>/.claude/projects/-…
-[…] Watching /…/<session>.jsonl (tmux pane: claude:0.0, tz fallback: Asia/Tokyo)
+[…] resolve_pane: selected %7 (rate-limit-banner-visible)
+[…] Watching /…/<session>.jsonl (tmux pane: auto:%7, tz fallback: Asia/Tokyo)
 ```
 
 If `ps` shows no process or the log is missing, check
 `/tmp/agent-auto-continue.stdout` for errors and report them to the user.
+If the watcher restarts while a rate-limit banner is still visible, you should
+also see a recovery line such as:
+
+```
+[…] recover_visible_rate_limit_state: recovered %7 from visible banner "You've hit your session limit · resets …"; waiting 10s before continue
+```
 
 ## Step 6 — Report back to the user
 
@@ -108,7 +114,8 @@ Tell them:
 2. The exact `watch.log` path so they can `tail -f` it later if curious
 3. That it'll auto-restart-tail when Claude Code starts a new session
    (background poller checks for newer .jsonl files every 60s)
-4. How to stop it: `pkill -f watch-claude-ratelimit`
+4. That pane selection is heuristic unless they explicitly set `CLAUDE_WATCH_PANE`
+5. How to stop it: `pkill -f watch-claude-ratelimit`
 
 ## Common adjustments
 
@@ -133,8 +140,9 @@ works — the log will record what it would have done.
 
 - launchd / systemd auto-startup — keep it manual for now
 - non-tmux injection (AppleScript, expect, etc.) — fragile, not portable
-- Multi-workspace concurrent watchers — works but requires explicit env
-  vars per workspace; mention only if user has >1 active Claude Code session
+- Multi-workspace concurrent watchers — works but still requires explicit
+  `CLAUDE_WATCH_PROJECT_DIR` per workspace; mention only if user has >1 active
+  Claude Code workspace
 
 ## If something breaks
 
