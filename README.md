@@ -56,11 +56,12 @@ keystroke API.
    ~/agent_auto_continue/install.sh
    ```
    It checks prerequisites and prints the suggested launch command.
-3. Launch the watcher in the background (run this from any shell on the
-   machine where Claude Code lives):
+3. Launch the watcher in its own detached tmux session (recommended; more
+   robust than plain `nohup` when started from another agent / IDE task /
+   managed shell that may reap child processes):
    ```bash
-   nohup ~/agent_auto_continue/watch-claude-ratelimit.sh </dev/null \
-       >/tmp/agent-auto-continue.stdout 2>&1 &
+   tmux new-session -d -s agent-auto-continue \
+       '~/agent_auto_continue/watch-claude-ratelimit.sh'
    ```
    Or do steps 2+3 in one go:
    ```bash
@@ -69,14 +70,20 @@ keystroke API.
 4. Start Claude Code in your tmux pane as usual.
 
 The watcher logs every event it sees to `~/.cache/agent-auto-continue/watch.log`,
-so you can audit exactly what it detected, which pane it picked, and when it fired.
+so you can audit exactly what it detected, which pane it picked, when it fired,
+and why it exited if it ever gets interrupted.
+
+If you intentionally prefer `nohup`, it still works from a normal interactive
+login shell. It is just not the default recommendation anymore because shells
+spawned by coding agents and some IDE task runners often reap background jobs
+when the parent command finishes.
 
 ## How Claude should set this up for you
 
 If you pulled this repo so Claude can read it, paste this into your chat:
 
 > "I cloned `agent_auto_continue`. Read its README and SKILL.md, verify the
-> prerequisites on this machine, and start the watcher in the background.
+> prerequisites on this machine, and start the watcher in a detached tmux session.
 > Pick a sensible tmux pane name based on what's already running."
 
 The SKILL.md file is written for Claude — it lists the exact checks and
@@ -97,10 +104,11 @@ All knobs are environment variables. Set them before launching the watcher.
 
 ## Verifying it's working
 
-After launching, check that the process is alive:
+After launching, check that the watcher tmux session is alive:
 
 ```bash
-ps -ef | grep watch-claude-ratelimit | grep -v grep
+tmux list-sessions | grep agent-auto-continue
+tmux capture-pane -pt agent-auto-continue | tail -20
 tail -f ~/.cache/agent-auto-continue/watch.log
 ```
 
@@ -136,11 +144,11 @@ while another pane is the one actually waiting on quota reset.
 ## Stopping the watcher
 
 ```bash
-pkill -f watch-claude-ratelimit
+tmux kill-session -t agent-auto-continue
 ```
 
-…or find its PID via `ps` and `kill <pid>`. It writes nothing destructive,
-so killing mid-sleep is safe — just relaunch later.
+…or find its PID via `pgrep -af watch-claude-ratelimit` and `kill <pid>`.
+It writes nothing destructive, so killing mid-sleep is safe — just relaunch later.
 
 ## What's in the repo
 

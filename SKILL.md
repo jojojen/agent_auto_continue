@@ -63,18 +63,25 @@ annoying to undo, so it's explicit.
 
 ## Step 4 — Launch the watcher
 
-Default launch (recommended; lets the watcher auto-select the best Claude pane):
+Default launch (recommended; puts the watcher in its own detached tmux
+session so it is not reaped when an agent / IDE / managed parent shell exits):
 
 ```bash
-nohup ./watch-claude-ratelimit.sh </dev/null >/tmp/agent-auto-continue.stdout 2>&1 &
+tmux has-session -t agent-auto-continue 2>/dev/null && tmux kill-session -t agent-auto-continue
+tmux new-session -d -s agent-auto-continue './watch-claude-ratelimit.sh'
 ```
 
 Only hard-pin a pane when the user asks for it (e.g. `mywork:1.0`):
 
 ```bash
-CLAUDE_WATCH_PANE=mywork:1.0 nohup ./watch-claude-ratelimit.sh \
-    </dev/null >/tmp/agent-auto-continue.stdout 2>&1 &
+tmux has-session -t agent-auto-continue 2>/dev/null && tmux kill-session -t agent-auto-continue
+tmux new-session -d -s agent-auto-continue \
+    "env CLAUDE_WATCH_PANE=mywork:1.0 ./watch-claude-ratelimit.sh"
 ```
+
+Use plain `nohup ... &` only from a normal interactive login shell. Do not
+use it as the default launch path when another agent or tool runner is
+starting the watcher, because parent-process cleanup often kills the child.
 
 If the user's machine isn't on Asia/Tokyo and the rate-limit messages they
 see don't carry a `(Region/City)` tag, also set
@@ -83,8 +90,8 @@ see don't carry a `(Region/City)` tag, also set
 ## Step 5 — Verify it's running
 
 ```bash
-ps -ef | grep watch-claude-ratelimit | grep -v grep
-sleep 2
+tmux list-sessions | grep agent-auto-continue
+tmux capture-pane -pt agent-auto-continue | tail -20
 tail -10 "$HOME/.cache/agent-auto-continue/watch.log"
 ```
 
@@ -97,8 +104,9 @@ The log should show:
 […] Watching /…/<session>.jsonl (tmux pane: auto:%7, tz fallback: Asia/Tokyo)
 ```
 
-If `ps` shows no process or the log is missing, check
-`/tmp/agent-auto-continue.stdout` for errors and report them to the user.
+If the tmux session is missing or the log is missing, re-run the launch
+command in the foreground once to capture the startup error, then report it
+to the user.
 If the watcher restarts while a rate-limit banner is still visible, you should
 also see a recovery line such as:
 
@@ -111,11 +119,12 @@ also see a recovery line such as:
 Tell them:
 
 1. The watcher PID and tmux pane it's watching
+   Also report the detached tmux session name: `agent-auto-continue`
 2. The exact `watch.log` path so they can `tail -f` it later if curious
 3. That it'll auto-restart-tail when Claude Code starts a new session
    (background poller checks for newer .jsonl files every 60s)
 4. That pane selection is heuristic unless they explicitly set `CLAUDE_WATCH_PANE`
-5. How to stop it: `pkill -f watch-claude-ratelimit`
+5. How to stop it: `tmux kill-session -t agent-auto-continue`
 
 ## Common adjustments
 
@@ -148,4 +157,6 @@ works — the log will record what it would have done.
 
 The debug log at `$HOME/.cache/agent-auto-continue/watch.log` records every
 detection / parse attempt / debounce skip / continue send. Ask the user to
-share the last 30 lines if they report an issue.
+share the last 30 lines if they report an issue. If the watcher dies, the new
+startup / signal / exit logs will usually show whether it received `SIGTERM`,
+`SIGHUP`, or another external shutdown.

@@ -12,15 +12,16 @@
 #   ./install.sh                # check + print suggested command
 #   ./install.sh --start        # also launch the watcher in the background
 #
-# After installation, attach to your tmux session (default ``claude:0.0``) and
-# run Claude Code as usual. When you hit the usage limit, the watcher waits
-# for the reset moment, then types ``continue`` and presses Enter for you.
+# After installation, attach to your tmux session and run Claude Code as usual.
+# When you hit the usage limit, the watcher waits for the reset moment, then
+# types ``continue`` and presses Enter for you.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 err() { printf "✗ %s\n" "$*" >&2; }
 ok()  { printf "✓ %s\n" "$*"; }
+WATCH_SESSION_NAME="agent-auto-continue"
 
 # --- prerequisite checks --------------------------------------------------
 
@@ -57,32 +58,38 @@ ok "scripts marked executable"
 echo ""
 echo "═══ Setup complete ═══"
 echo ""
-echo "To start the watcher in the background:"
+echo "To start the watcher in its own detached tmux session (recommended):"
 echo ""
-echo "  nohup \"$SCRIPT_DIR/watch-claude-ratelimit.sh\" </dev/null \\"
-echo "    >/tmp/agent-auto-continue.stdout 2>&1 &"
+echo "  tmux has-session -t $WATCH_SESSION_NAME 2>/dev/null && tmux kill-session -t $WATCH_SESSION_NAME"
+echo "  tmux new-session -d -s $WATCH_SESSION_NAME '$SCRIPT_DIR/watch-claude-ratelimit.sh'"
 echo ""
 echo "The debug log is written to: \$HOME/.cache/agent-auto-continue/watch.log"
 echo "(env: CLAUDE_WATCH_LOG to override)"
+echo "The watcher stdout/stderr stays attached to the tmux session:"
+echo "  tmux capture-pane -pt $WATCH_SESSION_NAME | tail -20"
 echo ""
 echo "Env vars you may want to set BEFORE launching:"
-echo "  export CLAUDE_WATCH_PANE=claude:0.0         # default; tmux target"
+echo "  export CLAUDE_WATCH_PANE=claude:0.0         # optional hard pin; usually leave unset"
 echo "  export CLAUDE_WATCH_DEFAULT_TZ=Asia/Tokyo   # fallback timezone"
 echo "  export CLAUDE_WATCH_BUFFER=10               # seconds past reset"
+echo ""
+echo "If you really want nohup, use it only from a normal interactive shell."
+echo "Agent / IDE task shells often reap background children when the parent exits."
 echo ""
 
 # --- optionally auto-start ------------------------------------------------
 
 if [ "${1:-}" = "--start" ]; then
-    echo "Starting watcher in background..."
-    nohup "$SCRIPT_DIR/watch-claude-ratelimit.sh" </dev/null \
-        >/tmp/agent-auto-continue.stdout 2>&1 &
-    pid=$!
+    echo "Starting watcher in detached tmux session..."
+    tmux has-session -t "$WATCH_SESSION_NAME" 2>/dev/null && tmux kill-session -t "$WATCH_SESSION_NAME"
+    tmux new-session -d -s "$WATCH_SESSION_NAME" "$SCRIPT_DIR/watch-claude-ratelimit.sh"
     sleep 1
-    if kill -0 "$pid" 2>/dev/null; then
-        ok "Watcher started (PID ${pid}). Tail the debug log to see activity."
+    if tmux has-session -t "$WATCH_SESSION_NAME" 2>/dev/null; then
+        pid="$(tmux list-panes -t "$WATCH_SESSION_NAME" -F '#{pane_pid}' | head -1)"
+        ok "Watcher started in tmux session '$WATCH_SESSION_NAME' (pane pid ${pid})."
+        ok "Use 'tmux capture-pane -pt $WATCH_SESSION_NAME | tail -20' and tail the debug log to see activity."
     else
-        err "Watcher exited immediately. Check /tmp/agent-auto-continue.stdout for details."
+        err "Watcher session did not stay up. Start '$SCRIPT_DIR/watch-claude-ratelimit.sh' in the foreground once to capture the error."
         exit 1
     fi
 fi
