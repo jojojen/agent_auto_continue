@@ -37,10 +37,12 @@ import datetime as _dt
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 try:
@@ -92,6 +94,9 @@ DEFAULT_LOG_PATH = Path.home() / ".cache" / "agent-auto-continue" / "watch.log"
 LOG_PATH = Path(os.environ.get("CLAUDE_WATCH_LOG", str(DEFAULT_LOG_PATH)))
 SESSION_POLL_SECS = 60
 PANE_CAPTURE_LINES = 120
+SEND_VERIFY_SECS = float(os.environ.get("CLAUDE_WATCH_SEND_VERIFY_SECS", "1.2"))
+SNAPSHOT_LINES = int(os.environ.get("CLAUDE_WATCH_SNAPSHOT_LINES", "12"))
+SNAPSHOT_MAX_CHARS = int(os.environ.get("CLAUDE_WATCH_SNAPSHOT_MAX_CHARS", "700"))
 RATE_LIMIT_PANE_MARKERS = (
     "you've hit your session limit",
     "you've hit your weekly limit",
@@ -108,6 +113,7 @@ EMPTY_SESSION_MARKERS = (
     "conversation was just cleared",
     "what would you like to work on?",
 )
+_EXIT_REASON = "normal-exit"
 
 
 def log(msg: str) -> None:
@@ -119,6 +125,29 @@ def log(msg: str) -> None:
             f.write(stamped + "\n")
     except Exception:
         pass
+
+
+def _set_exit_reason(reason: str) -> None:
+    global _EXIT_REASON
+    _EXIT_REASON = reason
+
+
+def _handle_termination(signum: int, _frame) -> None:
+    try:
+        signame = signal.Signals(signum).name
+    except Exception:
+        signame = f"SIG{signum}"
+    _set_exit_reason(f"signal:{signame}")
+    log(f"Received {signame}; shutting down")
+    raise SystemExit(128 + signum)
+
+
+def _register_signal_handlers() -> None:
+    for signame in ("SIGTERM", "SIGHUP", "SIGQUIT"):
+        sig = getattr(signal, signame, None)
+        if sig is None:
+            continue
+        signal.signal(sig, _handle_termination)
 
 
 def resolve_project_dir() -> Path | None:
@@ -321,6 +350,42 @@ def _capture_pane_tail(pane_id: str, *, lines: int = PANE_CAPTURE_LINES) -> str:
         return ""
 
 
+def _single_line(text: str, *, limit: int = SNAPSHOT_MAX_CHARS) -> str:
+    compact = " | ".join(line.strip() for line in text.splitlines() if line.strip())
+    compact = compact.replace("\t", " ")
+    if len(compact) > limit:
+        return compact[: limit - 3] + "..."
+    return compact
+
+
+def _pane_summary(pane_id: str) -> str:
+    if not pane_id:
+        return "pane=?"
+    try:
+        summary = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{session_name}:#{window_index}.#{pane_index} "
+                "#{pane_id} #{pane_current_command} active=#{window_activity}",
+            ],
+            check=False,
+            timeout=10,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception as exc:
+        return f"{pane_id} summary-error={exc}"
+    return summary or f"{pane_id} summary-unavailable"
+
+
+def _pane_snapshot(pane_id: str, *, lines: int = SNAPSHOT_LINES) -> str:
+    return _single_line(_capture_pane_tail(pane_id, lines=lines))
+
+
 def _pane_text_has_any(pane_text: str, markers: tuple[str, ...]) -> bool:
     lowered = pane_text.lower()
     return any(marker in lowered for marker in markers)
@@ -370,6 +435,10 @@ def _select_best_claude_pane() -> tuple[str | None, str]:
 def recover_visible_rate_limit_state() -> bool:
     pane_id, reason = _select_best_claude_pane()
     if not pane_id or reason != "rate-limit-banner-visible":
+        log(
+            "recover_visible_rate_limit_state: no recoverable pane "
+            f"(selected={pane_id or 'none'}, reason={reason})"
+        )
         return False
     pane_text = _capture_pane_tail(pane_id)
     banner = _extract_visible_rate_limit_banner(pane_text)
@@ -446,19 +515,31 @@ def sleep_in_chunks(total_secs: int) -> None:
 
 def send_continue(current=None) -> None:
     target = resolve_pane(current)
-    log(f"Sending 'continue' to tmux pane {target}")
+    before_snapshot = _pane_snapshot(target)
+    log(
+        "Sending 'continue' to tmux pane "
+        f"{target} [{_pane_summary(target)}] "
+        f"pre-snapshot={before_snapshot!r}"
+    )
     try:
         # Send text and Enter as SEPARATE events with a pause between. Claude
         # Code's Ink TUI debounces input; a combined "continue" + "Enter" often
         # lands the Enter before the text registers, leaving it unsubmitted.
-        subprocess.run(
+        text_send = subprocess.run(
             ["tmux", "send-keys", "-t", target, "-l", "continue"],
             check=False, timeout=10,
         )
         time.sleep(0.8)
-        subprocess.run(
+        enter_send = subprocess.run(
             ["tmux", "send-keys", "-t", target, "Enter"],
             check=False, timeout=10,
+        )
+        time.sleep(max(0.0, SEND_VERIFY_SECS))
+        after_snapshot = _pane_snapshot(target)
+        log(
+            "send_continue: tmux send-keys completed "
+            f"(text_rc={text_send.returncode}, enter_rc={enter_send.returncode}) "
+            f"post-snapshot={after_snapshot!r}"
         )
     except Exception as exc:
         log(f"tmux send-keys failed: {exc}")
@@ -479,25 +560,40 @@ class TailFollower:
             stderr=subprocess.DEVNULL,
             text=True,
         )
+        log(
+            f"TailFollower.start: path={self.path} pid={self.proc.pid}"
+        )
 
     def stop(self) -> None:
         self._stop = True
         if self.proc is not None:
             try:
+                log(
+                    f"TailFollower.stop: terminating pid={self.proc.pid} path={self.path}"
+                )
                 self.proc.terminate()
                 self.proc.wait(timeout=5)
+                log(
+                    f"TailFollower.stop: pid={self.proc.pid} exited rc={self.proc.returncode}"
+                )
             except Exception:
                 try:
                     self.proc.kill()
+                    log(f"TailFollower.stop: killed pid={self.proc.pid}")
                 except Exception:
                     pass
 
-    def lines(self):
+    def lines(self) -> Iterator[str]:
         assert self.proc is not None and self.proc.stdout is not None
         for raw in self.proc.stdout:
             if self._stop:
                 break
             yield raw
+        rc = self.proc.poll()
+        log(
+            f"TailFollower.lines: stream ended path={self.path} "
+            f"pid={self.proc.pid} rc={rc} stop={self._stop}"
+        )
 
 
 def watch_loop() -> int:
@@ -528,7 +624,11 @@ def watch_loop() -> int:
             time.sleep(SESSION_POLL_SECS)
             latest = latest_session_log(project_dir)
             if latest is not None and latest != current:
-                log(f"New session log detected: {latest} — switching tail")
+                old_proc = follower.proc.pid if follower.proc is not None else "?"
+                log(
+                    "New session log detected: "
+                    f"{latest} — switching tail from {current} (pid={old_proc})"
+                )
                 old = follower
                 follower = TailFollower(latest)
                 follower.start()
@@ -596,13 +696,28 @@ def watch_loop() -> int:
 
 
 def main() -> int:
-    log("agent_auto_continue watcher starting")
+    _register_signal_handlers()
+    log(
+        "agent_auto_continue watcher starting "
+        f"(pid={os.getpid()}, ppid={os.getppid()}, cwd={os.getcwd()}, "
+        f"log={LOG_PATH}, default_tz={_DEFAULT_TZ_NAME})"
+    )
     try:
         return watch_loop()
     except KeyboardInterrupt:
+        _set_exit_reason("keyboard-interrupt")
         log("interrupted, exiting")
         return 0
+    except SystemExit:
+        raise
+    except Exception as exc:
+        _set_exit_reason(f"fatal:{type(exc).__name__}")
+        log(f"fatal error: {exc!r}")
+        raise
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        log(f"agent_auto_continue watcher exiting ({_EXIT_REASON})")
